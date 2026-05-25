@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.maniskill_policy as maniskill_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -356,6 +357,53 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotManiSkillDataConfig(DataConfigFactory):
+    """LeRobot config for ManiSkill datasets converted by scripts/convert_traj_to_lerobot.py."""
+
+    output_action_dim: int = 8
+    extra_delta_transform: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[maniskill_policy.ManiSkillInputs(model_type=model_config.model_type)],
+            outputs=[maniskill_policy.ManiSkillOutputs(action_dim=self.output_action_dim)],
+        )
+
+        if self.extra_delta_transform:
+            # Match existing pi0_libero-trained ManiSkill checkpoints: first six joint dims are deltas,
+            # the remaining action dims stay absolute.
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -673,6 +721,18 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
         # Check the base TrainConfig class for a full list of available hyperparameters.
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_maniskill",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotManiSkillDataConfig(
+            repo_id="local/maniskill_myws_multitask",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            output_action_dim=8,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
     ),
     TrainConfig(

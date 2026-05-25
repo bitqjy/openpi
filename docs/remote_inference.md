@@ -19,6 +19,20 @@ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_droid 
 
 This will start a policy server that will serve the policy specified by the `config` and `dir` arguments. The policy will be served on the specified port (default: 8000).
 
+For `maniskill_myws` checkpoints, use the project wrapper and the ManiSkill-specific config instead of the official LIBERO configs:
+
+```bash
+cd third_party/openpi
+uv run python ../../scripts/pi0/serve.py \
+  --config pi0_maniskill \
+  --checkpoint ../../checkpoints_openpi/pi0_maniskill/ms_pi0_maniskill_v1/<step> \
+  --port 8000 \
+  --xla-safe
+```
+
+Use `pi0_libero` / `pi05_libero` only for the official LIBERO pipeline; ManiSkill `pd_joint_pos` training and deployment should use `pi0_maniskill`.
+Older ManiSkill checkpoints may still live under a `checkpoints_openpi/pi0_libero/...` directory; serve them with `--config pi0_maniskill` as well.
+
 ## Querying the remote policy server from your robot code
 
 We provide a client utility with minimal dependencies that you can easily embed into any robot codebase.
