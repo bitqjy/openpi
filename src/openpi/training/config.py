@@ -361,6 +361,7 @@ class LeRobotManiSkillDataConfig(DataConfigFactory):
     """LeRobot config for ManiSkill datasets converted by scripts/convert_traj_to_lerobot.py."""
 
     output_action_dim: int = 8
+    absolute_action_dim: int = 1
     extra_delta_transform: bool = True
 
     @override
@@ -385,9 +386,18 @@ class LeRobotManiSkillDataConfig(DataConfigFactory):
         )
 
         if self.extra_delta_transform:
-            # Match existing pi0_libero-trained ManiSkill checkpoints: first six joint dims are deltas,
-            # the remaining action dims stay absolute.
-            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            if self.output_action_dim <= self.absolute_action_dim:
+                raise ValueError(
+                    "output_action_dim must be larger than absolute_action_dim when using delta actions."
+                )
+            # ManiSkill pd_joint_pos datasets store absolute targets as:
+            # [q1, q2, q3, q4, q5, q6, q7, gripper].
+            # Train the seven arm joints as deltas relative to state[:7], keep the
+            # gripper absolute, then convert back to pd_joint_pos targets at inference.
+            delta_action_mask = _transforms.make_bool_mask(
+                self.output_action_dim - self.absolute_action_dim,
+                -self.absolute_action_dim,
+            )
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -731,6 +741,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
             output_action_dim=8,
+            absolute_action_dim=1,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
