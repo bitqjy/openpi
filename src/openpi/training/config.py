@@ -361,6 +361,7 @@ class LeRobotManiSkillDataConfig(DataConfigFactory):
     """LeRobot config for ManiSkill datasets converted by scripts/convert_traj_to_lerobot.py."""
 
     output_action_dim: int = 8
+    delta_action_dim: int | None = None
     absolute_action_dim: int = 1
     extra_delta_transform: bool = True
 
@@ -386,16 +387,23 @@ class LeRobotManiSkillDataConfig(DataConfigFactory):
         )
 
         if self.extra_delta_transform:
-            if self.output_action_dim <= self.absolute_action_dim:
+            delta_action_dim = self.delta_action_dim
+            if delta_action_dim is None:
+                delta_action_dim = self.output_action_dim - self.absolute_action_dim
+            if delta_action_dim < 0 or self.absolute_action_dim < 0:
+                raise ValueError("delta_action_dim and absolute_action_dim must be non-negative.")
+            if delta_action_dim + self.absolute_action_dim > self.output_action_dim:
                 raise ValueError(
-                    "output_action_dim must be larger than absolute_action_dim when using delta actions."
+                    "delta_action_dim + absolute_action_dim must fit within output_action_dim."
                 )
             # ManiSkill pd_joint_pos datasets store absolute targets as:
             # [q1, q2, q3, q4, q5, q6, q7, gripper].
-            # Train the seven arm joints as deltas relative to state[:7], keep the
-            # gripper absolute, then convert back to pd_joint_pos targets at inference.
+            # By default, train the seven arm joints as deltas relative to state[:7],
+            # keep the gripper absolute, then convert back to pd_joint_pos targets at
+            # inference. Legacy configs can set delta_action_dim=6 to reproduce the
+            # previous make_bool_mask(6, -1) behavior.
             delta_action_mask = _transforms.make_bool_mask(
-                self.output_action_dim - self.absolute_action_dim,
+                delta_action_dim,
                 -self.absolute_action_dim,
             )
             data_transforms = data_transforms.push(
@@ -741,9 +749,48 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
             output_action_dim=8,
+            delta_action_dim=7,
             absolute_action_dim=1,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_maniskill_legacy",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotManiSkillDataConfig(
+            repo_id="local/maniskill_myws_multitask",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            output_action_dim=8,
+            delta_action_dim=6,
+            absolute_action_dim=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_maniskill",
+        # Keep the model action_dim at 32 to match pi0.5 base weights; the
+        # ManiSkill data/output transforms keep the real control action at 8D.
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16, discrete_state_input=True),
+        data=LeRobotManiSkillDataConfig(
+            repo_id="local/maniskill_myws_multitask",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            output_action_dim=8,
+            delta_action_dim=7,
+            absolute_action_dim=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
         num_train_steps=30_000,
     ),
     TrainConfig(

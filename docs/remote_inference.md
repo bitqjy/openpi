@@ -30,8 +30,8 @@ uv run python ../../scripts/pi0/serve.py \
   --xla-safe
 ```
 
-Use `pi0_libero` / `pi05_libero` only for the official LIBERO pipeline; ManiSkill `pd_joint_pos` training and deployment should use `pi0_maniskill`.
-Older ManiSkill checkpoints may still live under a `checkpoints_openpi/pi0_libero/...` directory; serve them with `--config pi0_maniskill` as well.
+Use `pi0_libero` / `pi05_libero` only for the official LIBERO pipeline; ManiSkill `pd_joint_pos` training and deployment should use `pi0_maniskill` or `pi05_maniskill`.
+Older ManiSkill checkpoints may still live under a `checkpoints_openpi/pi0_libero/...` directory; serve them with the config that matches their action semantics, e.g. `pi0_maniskill` or `pi0_maniskill_legacy`.
 
 ## Querying the remote policy server from your robot code
 
