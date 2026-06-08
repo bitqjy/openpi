@@ -113,10 +113,11 @@ class PI0Pytorch(nn.Module):
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
+        self.dmf_depth: int | None = None
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         try:
-            from transformers.models.siglip import check
+            from transformers.models.siglip import check  # noqa: PLC0415
 
             if not check.check_whether_transformers_replace_is_installed_correctly():
                 raise ValueError(msg)
@@ -144,6 +145,19 @@ class PI0Pytorch(nn.Module):
     def is_gradient_checkpointing_enabled(self):
         """Check if gradient checkpointing is enabled."""
         return self.gradient_checkpointing_enabled
+
+    def set_dmf_depth(self, dmf_depth: int | None):
+        """Set the action-expert layer split for pi0.5 DMF.
+
+        Layers before this depth use the source-time condition t; layers at and
+        after this depth use the target-time condition r. None disables the
+        strict split and falls back to the model's standard single-time path.
+        """
+        if dmf_depth is not None:
+            num_layers = len(self.paligemma_with_expert.gemma_expert.model.layers)
+            if dmf_depth <= 0 or dmf_depth >= num_layers:
+                raise ValueError(f"dmf_depth must be in [1, {num_layers - 1}], got {dmf_depth}.")
+        self.dmf_depth = dmf_depth
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -234,7 +248,7 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
+    def embed_suffix(self, state, noisy_actions, timestep, target_timestep=None):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -265,6 +279,20 @@ class PI0Pytorch(nn.Module):
             timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0, device=timestep.device
         )
         time_emb = time_emb.type(dtype=timestep.dtype)
+        target_time_emb = None
+        if target_timestep is not None:
+            target_time_emb = create_sinusoidal_pos_embedding(
+                target_timestep,
+                self.action_in_proj.out_features,
+                min_period=4e-3,
+                max_period=4.0,
+                device=target_timestep.device,
+            )
+            target_time_emb = target_time_emb.type(dtype=timestep.dtype)
+        if target_time_emb is not None and not self.pi05:
+            # Parameter-free MVP conditioning for DMF intervals. When r == t this is exactly
+            # the original single-time embedding, so existing checkpoints remain compatible.
+            time_emb = 0.5 * (time_emb + target_time_emb)
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
@@ -293,8 +321,12 @@ class PI0Pytorch(nn.Module):
                 return F.silu(x)
 
             time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
+            if target_time_emb is not None and self.dmf_depth is not None:
+                target_time_emb = self._apply_checkpoint(time_mlp_func, target_time_emb)
+                adarms_cond = (time_emb, target_time_emb)
+            else:
+                adarms_cond = time_emb
             action_time_emb = action_emb
-            adarms_cond = time_emb
 
         # Add to input tokens
         embs.append(action_time_emb)
@@ -313,6 +345,77 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
+    def preprocess_observation_for_velocity(self, observation, *, train=True):
+        return self._preprocess_observation(observation, train=train)
+
+    def predict_velocity_from_preprocessed(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        noisy_actions,
+        timestep,
+        target_timestep=None,
+    ) -> Tensor:
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, noisy_actions, timestep, target_timestep
+        )
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+                dmf_depth=self.dmf_depth,
+            )
+            return suffix_out
+
+        suffix_out = self._apply_checkpoint(
+            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        )
+
+        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+
+        def action_out_proj_func(suffix_out):
+            return self.action_out_proj(suffix_out)
+
+        return self._apply_checkpoint(action_out_proj_func, suffix_out)
+
+    def predict_velocity(self, observation, noisy_actions, timestep, target_timestep=None, *, train=True) -> Tensor:
+        images, img_masks, lang_tokens, lang_masks, state = self.preprocess_observation_for_velocity(
+            observation, train=train
+        )
+        return self.predict_velocity_from_preprocessed(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noisy_actions,
+            timestep,
+            target_timestep,
+        )
+
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
@@ -327,53 +430,14 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        # Prepare attention masks
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-
-        # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
-            )
-            return suffix_out
-
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        v_t = self.predict_velocity_from_preprocessed(
+            images, img_masks, lang_tokens, lang_masks, state, x_t, time, time
         )
-
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-
-        # Apply gradient checkpointing to final action projection if enabled
-        def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
-
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def sample_actions(self, device, observation, noise=None, num_steps=10, *, use_dmf=False) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
@@ -397,6 +461,19 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+
+        if use_dmf:
+            timestep = torch.ones(bsize, dtype=torch.float32, device=device)
+            target_timestep = torch.zeros(bsize, dtype=torch.float32, device=device)
+            d_cur = self.denoise_step(
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                noise,
+                timestep,
+                target_timestep,
+            )
+            return noise - d_cur
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -425,9 +502,12 @@ class PI0Pytorch(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        target_timestep=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, timestep, target_timestep
+        )
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -453,6 +533,7 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
+            dmf_depth=self.dmf_depth,
         )
 
         suffix_out = outputs_embeds[1]

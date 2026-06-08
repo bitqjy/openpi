@@ -589,6 +589,33 @@ class TrainConfig:
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
+    # Training objective used by scripts/train_pytorch.py.
+    pytorch_train_objective: Literal["fm", "dmf"] = "fm"
+    # Action-expert split depth for pi0.5 DMF. None uses the middle layer.
+    pytorch_dmf_depth: int | None = None
+    # DMF auxiliary objective variant. "mf" is the original MeanFlow target;
+    # "imf" uses the iMeanFlow consistency target with an instant-velocity head.
+    pytorch_dmf_loss_type: Literal["mf", "imf"] = "mf"
+    # If true, freeze the PaliGemma vision-language branch during PyTorch training.
+    pytorch_freeze_vlm: bool = False
+    # Maximum MeanFlow loss weight for DMF. The auxiliary FM loss always has weight 1.
+    pytorch_dmf_mf_weight: float = 0.1
+    # Linearly warm up the MeanFlow loss weight over this many optimizer steps.
+    pytorch_dmf_mf_warmup_steps: int = 1000
+    # Clamp sampled DMF intervals to reduce high-variance JVP targets.
+    pytorch_dmf_max_interval: float = 0.75
+    # Clamp the detached MeanFlow regression target. None disables clipping.
+    pytorch_dmf_target_clip: float | None = 20.0
+    # iMF consistency-loss weights inside the warmed-up DMF auxiliary term.
+    pytorch_imf_u_weight: float = 1.0
+    pytorch_imf_v_weight: float = 1.0
+    # Reweight iMF per-sample losses by stopgrad((loss + eps) ** p), matching iMeanFlow.
+    pytorch_imf_adaptive_weight: bool = True
+    pytorch_imf_adaptive_p: float = 0.5
+    pytorch_imf_adaptive_eps: float = 1e-2
+    # Clamp the adaptive denominator so iMF reweighting downweights hard samples
+    # without amplifying already-small action MSE values. None disables the clamp.
+    pytorch_imf_adaptive_min_denom: float | None = 1.0
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)

@@ -1,0 +1,26 @@
+cd /home/yuanhao/VLA/openpi
+
+source /DATA/disk0/yuanhao/anaconda3/etc/profile.d/conda.sh
+conda activate openpi
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+PYTHONPATH=/home/yuanhao/VLA/openpi/third_party/libero:$PYTHONPATH \
+torchrun \
+  --standalone \
+  --nnodes=1 \
+  --nproc_per_node=8 \
+  scripts/train_pytorch.py pi05_libero \
+  --project-name openpi-dmf \
+  --exp-name pi05_libero_dmf_mvp_b8 \
+  --pytorch-weight-path /home/yuanhao/VLA/openpi/checkpoints/pi05_libero \
+  --pytorch-train-objective dmf \
+  --pytorch-freeze-vlm \
+  --pytorch-dmf-depth 9 \
+  --pytorch-training-precision bfloat16 \
+  --batch-size 8 \
+  --num-workers 4 \
+  --num-train-steps 100 \
+  --save-interval 100 \
+  --log-interval 10 \
+  --wandb-enabled \
+  --overwrite

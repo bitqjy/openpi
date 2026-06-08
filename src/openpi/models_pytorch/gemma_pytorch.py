@@ -96,6 +96,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        dmf_depth: int | None = None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -119,6 +120,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+                dmf_depth=dmf_depth,
             )
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
@@ -127,19 +129,19 @@ class PaliGemmaWithExpertModel(nn.Module):
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
-            # Check if gradient checkpointing is enabled for any of the models
+            # Check if gradient checkpointing is enabled for any of the models.
+            # DMF passes the action-expert AdaRMS condition as a (t, r) tuple and
+            # uses JVP through this joint prefix/suffix path. Activation
+            # checkpointing recomputation is not stable for that higher-order
+            # graph, so keep checkpointing strictly opt-in and disable it for
+            # the DMF split path.
             use_gradient_checkpointing = (
                 hasattr(self.gemma_expert.model, "gradient_checkpointing")
                 and self.gemma_expert.model.gradient_checkpointing
                 and self.training
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
-
-            # Force enable gradient checkpointing if we're in training mode and the model supports it
-            if self.training and hasattr(self.gemma_expert.model, "gradient_checkpointing"):
-                if not self.gemma_expert.model.gradient_checkpointing:
-                    print("Forcing gradient checkpointing to be enabled for Gemma expert model")
-                    self.gemma_expert.model.gradient_checkpointing = True
-                use_gradient_checkpointing = True
+            if isinstance(adarms_cond[1], tuple):
+                use_gradient_checkpointing = False
 
             # Debug gradient checkpointing status
             if hasattr(self, "_debug_gc_printed") and not self._debug_gc_printed:
@@ -157,6 +159,13 @@ class PaliGemmaWithExpertModel(nn.Module):
             # Define the complete layer computation function for gradient checkpointing
             def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
                 models = [self.paligemma.language_model, self.gemma_expert.model]
+                layer_adarms_cond = list(adarms_cond)
+                if isinstance(layer_adarms_cond[1], tuple):
+                    if dmf_depth is None:
+                        raise ValueError("dmf_depth must be set when suffix adarms_cond is a (t, r) tuple.")
+                    layer_adarms_cond[1] = (
+                        layer_adarms_cond[1][0] if layer_idx < dmf_depth else layer_adarms_cond[1][1]
+                    )
 
                 query_states = []
                 key_states = []
@@ -164,7 +173,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 gates = []
                 for i, hidden_states in enumerate(inputs_embeds):
                     layer = models[i].layers[layer_idx]
-                    hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+                    hidden_states, gate = layer.input_layernorm(hidden_states, cond=layer_adarms_cond[i])  # noqa: PLW2901
                     gates.append(gate)
 
                     input_shape = hidden_states.shape[:-1]
@@ -224,7 +233,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                     # first residual
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
                     after_first_residual = out_emb.clone()
-                    out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+                    out_emb, gate = layer.post_attention_layernorm(out_emb, cond=layer_adarms_cond[i])
                     # Convert to bfloat16 if the next layer (mlp) uses bfloat16
                     if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
                         out_emb = out_emb.to(dtype=torch.bfloat16)
@@ -262,7 +271,10 @@ class PaliGemmaWithExpertModel(nn.Module):
             def compute_final_norms(inputs_embeds, adarms_cond):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                    final_cond = adarms_cond[i]
+                    if isinstance(final_cond, tuple):
+                        final_cond = final_cond[1]
+                    out_emb, _ = models[i].norm(hidden_states, cond=final_cond)
                     outputs_embeds.append(out_emb)
                 return outputs_embeds
 
