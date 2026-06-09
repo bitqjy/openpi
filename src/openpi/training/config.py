@@ -593,11 +593,31 @@ class TrainConfig:
     pytorch_train_objective: Literal["fm", "dmf"] = "fm"
     # Action-expert split depth for pi0.5 DMF. None uses the middle layer.
     pytorch_dmf_depth: int | None = None
-    # DMF auxiliary objective variant. "mf" is the original MeanFlow target;
-    # "imf" uses the iMeanFlow consistency target with an instant-velocity head.
-    pytorch_dmf_loss_type: Literal["mf", "imf"] = "mf"
+    # DMF auxiliary objective variant. "idmf" is the stability-first corrected iMF objective.
+    pytorch_dmf_loss_type: Literal["mf", "imf", "idmf"] = "mf"
+    # Accumulate this many microbatches before one optimizer step.
+    pytorch_grad_accum_steps: int = 1
+    # iDMF JVP tangent. "boundary" uses stopgrad(u(x_t,t,t)); "cond" is kept for ablation only.
+    pytorch_idmf_tangent: Literal["cond", "boundary"] = "boundary"
+    # Robust iDMF velocity regression loss.
+    pytorch_idmf_loss_type: Literal["mse", "pseudo_huber", "cauchy"] = "pseudo_huber"
+    pytorch_idmf_loss_delta: float = 1.0
+    # Clip only the iDMF JVP correction term. None disables clipping.
+    pytorch_idmf_correction_clip: float | None = 5.0
+    # Short-to-long interval curriculum for corrected iDMF.
+    pytorch_idmf_min_interval: float = 0.02
+    pytorch_idmf_max_interval_start: float = 0.05
+    pytorch_idmf_max_interval_end: float = 0.30
+    pytorch_idmf_interval_warmup_steps: int = 5000
+    pytorch_idmf_short_interval_prob: float = 0.75
+    # pi0.5 DMF conditioning split. Soft split avoids abrupt r-conditioning in pretrained experts.
+    pytorch_dmf_split_mode: Literal["hard", "soft"] = "soft"
+    pytorch_dmf_blend_width: int = 6
+    pytorch_dmf_alpha_scale: float = 0.25
     # If true, freeze the PaliGemma vision-language branch during PyTorch training.
     pytorch_freeze_vlm: bool = False
+    # Freeze early action-expert transformer layers for stable iDMF warmup. None disables.
+    pytorch_freeze_action_encoder_until_layer: int | None = None
     # Maximum MeanFlow loss weight for DMF. The auxiliary FM loss always has weight 1.
     pytorch_dmf_mf_weight: float = 0.1
     # Linearly warm up the MeanFlow loss weight over this many optimizer steps.

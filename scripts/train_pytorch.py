@@ -23,6 +23,7 @@ Multi-Node Training:
 
 """
 
+import contextlib
 import dataclasses
 import gc
 import logging
@@ -36,6 +37,7 @@ import numpy as np
 import safetensors.torch
 import torch
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 import torch.nn.parallel
 import tqdm
 import wandb
@@ -318,12 +320,57 @@ def _sum_action_mse(pred, target):
     return torch.sum((pred.float() - target.float()) ** 2, dim=tuple(range(1, pred.ndim)))
 
 
+def _per_sample_action_loss(pred, target, *, loss_type: str, delta: float):
+    err = pred.float() - target.float()
+    reduce_dims = tuple(range(1, err.ndim))
+    if loss_type == "mse":
+        return torch.mean(err**2, dim=reduce_dims)
+    if loss_type == "pseudo_huber":
+        loss = (delta**2) * (torch.sqrt(1.0 + (err / delta) ** 2) - 1.0)
+        return torch.mean(loss, dim=reduce_dims)
+    if loss_type == "cauchy":
+        loss = (delta**2) * torch.log1p((err / delta) ** 2)
+        return torch.mean(loss, dim=reduce_dims)
+    raise ValueError(f"Unsupported loss_type: {loss_type}")
+
+
 def _adaptive_weighted_loss(per_sample_loss, normalizer_loss, eps, power, min_denom):
     weights = torch.clamp(normalizer_loss.float() + eps, min=eps).pow(power)
     if min_denom is not None:
         weights = torch.clamp(weights, min=min_denom)
     weights = weights.detach()
     return per_sample_loss / weights
+
+
+def _linear_schedule(start: float, end: float, warmup_steps: int, step: int) -> float:
+    if warmup_steps <= 0:
+        return float(end)
+    ratio = min(1.0, float(step + 1) / float(warmup_steps))
+    return float(start + ratio * (end - start))
+
+
+def _sample_idmf_times(batch_size, device, config, global_step):
+    t = _logit_normal_sample(batch_size, mean=0.0, std=1.0, device=device)
+    t = torch.clamp(t, min=0.05, max=0.995)
+    max_interval = _linear_schedule(
+        config.pytorch_idmf_max_interval_start,
+        config.pytorch_idmf_max_interval_end,
+        config.pytorch_idmf_interval_warmup_steps,
+        global_step,
+    )
+    if config.pytorch_idmf_short_interval_prob > 0:
+        use_short = torch.rand(batch_size, device=device) < config.pytorch_idmf_short_interval_prob
+    else:
+        use_short = torch.zeros(batch_size, device=device, dtype=torch.bool)
+    short_max = max(config.pytorch_idmf_min_interval, min(max_interval, 0.08))
+    long_max = max_interval
+    short_delta = torch.rand(batch_size, device=device) * short_max
+    long_delta = torch.rand(batch_size, device=device) * long_max
+    delta = torch.where(use_short, short_delta, long_delta)
+    delta = torch.minimum(delta, t - 0.001)
+    delta = torch.clamp(delta, min=config.pytorch_idmf_min_interval)
+    r = torch.clamp(t - delta, min=0.001, max=0.995)
+    return t, r, t - r
 
 
 def _assert_finite_tensor(name, tensor):
@@ -373,12 +420,16 @@ def compute_dmf_mse_loss(model, observation, actions, config, global_step):
     # length is capped because long intervals make the JVP target high variance
     # early in fine-tuning.
     noise_mf = torch.randn_like(actions)
-    ln_1 = _logit_normal_sample(batch_size, mean=-0.2, std=1.0, device=device)
-    ln_2 = _logit_normal_sample(batch_size, mean=0.2, std=1.0, device=device)
-    t_mf = torch.maximum(ln_1, ln_2)
-    r_mf = torch.minimum(ln_1, ln_2)
-    if config.pytorch_dmf_max_interval is not None:
-        r_mf = torch.maximum(r_mf, t_mf - config.pytorch_dmf_max_interval)
+    if config.pytorch_dmf_loss_type == "idmf":
+        t_mf, r_mf, interval_mf = _sample_idmf_times(batch_size, device, config, global_step)
+    else:
+        ln_1 = _logit_normal_sample(batch_size, mean=-0.2, std=1.0, device=device)
+        ln_2 = _logit_normal_sample(batch_size, mean=0.2, std=1.0, device=device)
+        t_mf = torch.maximum(ln_1, ln_2)
+        r_mf = torch.minimum(ln_1, ln_2)
+        if config.pytorch_dmf_max_interval is not None:
+            r_mf = torch.maximum(r_mf, t_mf - config.pytorch_dmf_max_interval)
+        interval_mf = t_mf - r_mf
     x_t_mf = t_mf[:, None, None] * noise_mf + (1 - t_mf[:, None, None]) * actions
     v_tgt_mf = noise_mf - actions
 
@@ -392,7 +443,7 @@ def compute_dmf_mse_loss(model, observation, actions, config, global_step):
 
     extra_losses = {
         "fm_loss": fm_loss.mean().detach(),
-        "dmf_interval": (t_mf - r_mf).mean().detach(),
+        "dmf_interval": interval_mf.mean().detach(),
     }
 
     if config.pytorch_dmf_loss_type == "mf":
@@ -461,6 +512,82 @@ def compute_dmf_mse_loss(model, observation, actions, config, global_step):
                 "du_dt_norm": du_dt.float().norm(dim=-1).mean().detach(),
             }
         )
+    elif config.pytorch_dmf_loss_type == "idmf":
+        v_inst = model_fn(x_t_mf, t_mf, t_mf)
+        _assert_finite_tensor("v_inst", v_inst)
+
+        if config.pytorch_idmf_tangent == "boundary":
+            x_tangent = v_inst.detach()
+        elif config.pytorch_idmf_tangent == "cond":
+            x_tangent = v_tgt_mf.detach()
+        else:
+            raise ValueError(f"Unsupported pytorch_idmf_tangent: {config.pytorch_idmf_tangent}")
+
+        primals = (x_t_mf, t_mf, r_mf)
+        tangents = (x_tangent, torch.ones_like(t_mf), torch.zeros_like(r_mf))
+        u, du_dt = torch.func.jvp(model_fn, primals, tangents)
+        _assert_finite_tensor("u", u)
+        _assert_finite_tensor("du_dt", du_dt)
+
+        correction = (t_mf - r_mf)[:, None, None] * du_dt.detach()
+        if config.pytorch_idmf_correction_clip is not None:
+            correction = torch.clamp(
+                correction,
+                -config.pytorch_idmf_correction_clip,
+                config.pytorch_idmf_correction_clip,
+            )
+
+        idmf_pred = u + correction
+        idmf_target = v_tgt_mf.detach()
+        idmf_u_raw = _per_sample_action_loss(
+            idmf_pred,
+            idmf_target,
+            loss_type=config.pytorch_idmf_loss_type,
+            delta=config.pytorch_idmf_loss_delta,
+        )
+        idmf_v_raw = _per_sample_action_loss(
+            v_inst,
+            idmf_target,
+            loss_type=config.pytorch_idmf_loss_type,
+            delta=config.pytorch_idmf_loss_delta,
+        )
+        _assert_finite_tensor("idmf_u_loss", idmf_u_raw)
+        _assert_finite_tensor("idmf_v_loss", idmf_v_raw)
+
+        if config.pytorch_imf_adaptive_weight:
+            idmf_u_loss = _adaptive_weighted_loss(
+                idmf_u_raw,
+                _sum_action_mse(idmf_pred, idmf_target),
+                config.pytorch_imf_adaptive_eps,
+                config.pytorch_imf_adaptive_p,
+                config.pytorch_imf_adaptive_min_denom,
+            )
+            idmf_v_loss = _adaptive_weighted_loss(
+                idmf_v_raw,
+                _sum_action_mse(v_inst, idmf_target),
+                config.pytorch_imf_adaptive_eps,
+                config.pytorch_imf_adaptive_p,
+                config.pytorch_imf_adaptive_min_denom,
+            )
+        else:
+            idmf_u_loss = idmf_u_raw
+            idmf_v_loss = idmf_v_raw
+
+        mf_loss = config.pytorch_imf_u_weight * idmf_u_loss + config.pytorch_imf_v_weight * idmf_v_loss
+        _assert_finite_tensor("idmf_loss", mf_loss)
+        extra_losses.update(
+            {
+                "mf_loss": mf_loss.mean().detach(),
+                "idmf_u_loss": idmf_u_raw.mean().detach(),
+                "idmf_v_loss": idmf_v_raw.mean().detach(),
+                "idmf_u_weighted_loss": idmf_u_loss.mean().detach(),
+                "idmf_v_weighted_loss": idmf_v_loss.mean().detach(),
+                "du_dt_norm": du_dt.float().norm(dim=-1).mean().detach(),
+                "jvp_tangent_norm": x_tangent.float().norm(dim=-1).mean().detach(),
+                "jvp_correction_norm": correction.float().norm(dim=-1).mean().detach(),
+                "v_target_norm": v_tgt_mf.float().norm(dim=-1).mean().detach(),
+            }
+        )
     else:
         raise ValueError(f"Unsupported pytorch_dmf_loss_type: {config.pytorch_dmf_loss_type}")
 
@@ -472,6 +599,9 @@ def compute_dmf_mse_loss(model, observation, actions, config, global_step):
     loss = fm_loss + mf_weight * mf_loss
     extra_losses["mf_weight"] = torch.tensor(mf_weight, device=device)
     extra_losses["dmf_aux_contribution"] = (mf_weight * mf_loss).mean().detach()
+    extra_losses["aux_to_fm_ratio"] = (
+        (mf_weight * mf_loss).mean() / (fm_loss.mean().detach() + 1e-8)
+    ).detach()
     return loss, extra_losses
 
 
@@ -488,10 +618,19 @@ def configure_dmf_split(model, config, is_main):
 
     num_layers = len(model_to_configure.paligemma_with_expert.gemma_expert.model.layers)
     dmf_depth = config.pytorch_dmf_depth if config.pytorch_dmf_depth is not None else num_layers // 2
-    model_to_configure.set_dmf_depth(dmf_depth)
+    model_to_configure.set_dmf_depth(
+        dmf_depth,
+        split_mode=config.pytorch_dmf_split_mode,
+        blend_width=config.pytorch_dmf_blend_width,
+        alpha_scale=config.pytorch_dmf_alpha_scale,
+    )
     if is_main:
         logging.info(
-            f"Enabled pi0.5 DMF action-expert split: layers < {dmf_depth} use t, layers >= {dmf_depth} use r"
+            "Enabled pi0.5 DMF action-expert split: depth=%s, mode=%s, blend_width=%s, alpha_scale=%s",
+            dmf_depth,
+            config.pytorch_dmf_split_mode,
+            config.pytorch_dmf_blend_width,
+            config.pytorch_dmf_alpha_scale,
         )
     return dmf_depth
 
@@ -504,6 +643,27 @@ def freeze_vlm_parameters(model, is_main):
     frozen = sum(param.numel() for param in model_to_freeze.parameters() if not param.requires_grad)
     if is_main:
         logging.info(f"Frozen PaliGemma VLM branch. Trainable params={trainable:,}, frozen params={frozen:,}")
+
+
+def freeze_action_encoder_layers(model, freeze_until_layer: int | None, is_main):
+    if freeze_until_layer is None:
+        return
+    model_to_freeze = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    expert_layers = model_to_freeze.paligemma_with_expert.gemma_expert.model.layers
+    if freeze_until_layer < 0 or freeze_until_layer > len(expert_layers):
+        raise ValueError(f"freeze_until_layer must be in [0, {len(expert_layers)}], got {freeze_until_layer}.")
+
+    for idx, layer in enumerate(expert_layers):
+        if idx < freeze_until_layer:
+            for param in layer.parameters():
+                param.requires_grad = False
+
+    if is_main:
+        trainable = sum(param.numel() for param in model_to_freeze.parameters() if param.requires_grad)
+        frozen = sum(param.numel() for param in model_to_freeze.parameters() if not param.requires_grad)
+        logging.info(
+            f"Frozen action expert layers < {freeze_until_layer}. Trainable params={trainable:,}, frozen params={frozen:,}"
+        )
 
 
 def train_loop(config: _config.TrainConfig):
@@ -528,31 +688,40 @@ def train_loop(config: _config.TrainConfig):
                 raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
-    elif config.overwrite and config.checkpoint_dir.exists():
+    elif is_main and config.overwrite and config.checkpoint_dir.exists():
         shutil.rmtree(config.checkpoint_dir)
         logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
     # Create checkpoint directory with experiment name
-    if not resuming:
+    if is_main and not resuming:
         # For new runs, create experiment-specific checkpoint directory
         exp_checkpoint_dir = config.checkpoint_dir
         exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
         logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
-    else:
+    elif is_main:
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+
+    if use_ddp:
+        dist.barrier()
 
     # Initialize wandb (only on main process)
     if is_main:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    if use_ddp:
+        dist.barrier()
 
     # Build data loader using the unified data loader
-    # Calculate effective batch size per GPU for DDP
-    # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
+    # For N GPUs, each GPU gets batch_size/N microbatch samples.
     world_size = torch.distributed.get_world_size() if use_ddp else 1
-    effective_batch_size = config.batch_size // world_size
+    local_micro_batch_size = config.batch_size // world_size
+    effective_optimizer_batch_size = config.batch_size * max(1, int(config.pytorch_grad_accum_steps))
     logging.info(
-        f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
+        "Using local microbatch per GPU: %s; global microbatch: %s; grad_accum_steps: %s; optimizer effective global batch: %s",
+        local_micro_batch_size,
+        config.batch_size,
+        config.pytorch_grad_accum_steps,
+        effective_optimizer_batch_size,
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
@@ -610,6 +779,7 @@ def train_loop(config: _config.TrainConfig):
     dmf_depth = configure_dmf_split(model, config, is_main)
     if config.pytorch_freeze_vlm:
         freeze_vlm_parameters(model, is_main)
+    freeze_action_encoder_layers(model, config.pytorch_freeze_action_encoder_until_layer, is_main)
 
     if hasattr(model, "gradient_checkpointing_enable") and config.pytorch_train_objective != "dmf":
         enable_gradient_checkpointing = True
@@ -693,26 +863,42 @@ def train_loop(config: _config.TrainConfig):
             f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
         )
         logging.info(
-            f"Training config: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, num_train_steps={config.num_train_steps}, objective={config.pytorch_train_objective}, dmf_depth={dmf_depth}, freeze_vlm={config.pytorch_freeze_vlm}"
+            f"Training config: batch_size={config.batch_size}, local_micro_batch_size={local_micro_batch_size}, optimizer_effective_batch_size={effective_optimizer_batch_size}, num_train_steps={config.num_train_steps}, objective={config.pytorch_train_objective}, dmf_depth={dmf_depth}, freeze_vlm={config.pytorch_freeze_vlm}, freeze_action_until={config.pytorch_freeze_action_encoder_until_layer}"
         )
         if config.pytorch_train_objective == "dmf":
             logging.info(
-                "DMF stability: loss_type=%s, mf_weight=%s, mf_warmup_steps=%s, max_interval=%s, target_clip=%s",
+                "DMF stability: loss_type=%s, mf_weight=%s, mf_warmup_steps=%s, max_interval=%s, target_clip=%s, split_mode=%s, blend_width=%s, alpha_scale=%s",
                 config.pytorch_dmf_loss_type,
                 config.pytorch_dmf_mf_weight,
                 config.pytorch_dmf_mf_warmup_steps,
                 config.pytorch_dmf_max_interval,
                 config.pytorch_dmf_target_clip,
+                config.pytorch_dmf_split_mode,
+                config.pytorch_dmf_blend_width,
+                config.pytorch_dmf_alpha_scale,
             )
-            if config.pytorch_dmf_loss_type == "imf":
+            if config.pytorch_dmf_loss_type in {"imf", "idmf"}:
                 logging.info(
-                    "iMF-C: u_weight=%s, v_weight=%s, adaptive=%s, adaptive_p=%s, adaptive_eps=%s, adaptive_min_denom=%s",
+                    "iMF weights: u_weight=%s, v_weight=%s, adaptive=%s, adaptive_p=%s, adaptive_eps=%s, adaptive_min_denom=%s",
                     config.pytorch_imf_u_weight,
                     config.pytorch_imf_v_weight,
                     config.pytorch_imf_adaptive_weight,
                     config.pytorch_imf_adaptive_p,
                     config.pytorch_imf_adaptive_eps,
                     config.pytorch_imf_adaptive_min_denom,
+                )
+            if config.pytorch_dmf_loss_type == "idmf":
+                logging.info(
+                    "iDMF: tangent=%s, loss=%s, delta=%s, correction_clip=%s, min_interval=%s, max_interval_start=%s, max_interval_end=%s, interval_warmup=%s, short_prob=%s",
+                    config.pytorch_idmf_tangent,
+                    config.pytorch_idmf_loss_type,
+                    config.pytorch_idmf_loss_delta,
+                    config.pytorch_idmf_correction_clip,
+                    config.pytorch_idmf_min_interval,
+                    config.pytorch_idmf_max_interval_start,
+                    config.pytorch_idmf_max_interval_end,
+                    config.pytorch_idmf_interval_warmup_steps,
+                    config.pytorch_idmf_short_interval_prob,
                 )
         logging.info(f"Memory optimizations: gradient_checkpointing={enable_gradient_checkpointing}")
         logging.info(
@@ -730,6 +916,10 @@ def train_loop(config: _config.TrainConfig):
         if is_main
         else None
     )
+
+    grad_accum_steps = max(1, int(config.pytorch_grad_accum_steps))
+    micro_step = 0
+    optim.zero_grad(set_to_none=True)
 
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
@@ -764,12 +954,35 @@ def train_loop(config: _config.TrainConfig):
 
             loss = losses.mean()
 
-            # Backward pass
-            loss.backward()
+            micro_step += 1
+            should_step = micro_step % grad_accum_steps == 0
+            if use_ddp and isinstance(model, torch.nn.parallel.DistributedDataParallel) and not should_step:
+                sync_context = model.no_sync()
+            else:
+                sync_context = contextlib.nullcontext()
+
+            # Backward pass. Scale the microbatch loss so accumulated gradients
+            # match the requested optimizer-batch objective.
+            with sync_context:
+                (loss / grad_accum_steps).backward()
 
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
+
+            # Collect microbatch stats. grad_norm is filled in only for the
+            # last microbatch in each optimizer step.
+            if is_main:
+                infos.append(
+                    {
+                        "loss": loss.item(),
+                        "learning_rate": optim.param_groups[0]["lr"],
+                        **{key: value.item() for key, value in extra_losses.items()},
+                    }
+                )
+
+            if not should_step:
+                continue
 
             # Gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
@@ -784,16 +997,9 @@ def train_loop(config: _config.TrainConfig):
                     param.grad.detach_()
                     param.grad = None
 
-            # Collect stats
-            if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                        **{key: value.item() for key, value in extra_losses.items()},
-                    }
-                )
+            global_step += 1
+            if is_main and len(infos) > 0:
+                infos[-1]["grad_norm"] = float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
@@ -825,7 +1031,15 @@ def train_loop(config: _config.TrainConfig):
                 avg_imf_v_loss = _avg_extra("imf_v_loss")
                 avg_imf_u_weighted_loss = _avg_extra("imf_u_weighted_loss")
                 avg_imf_v_weighted_loss = _avg_extra("imf_v_weighted_loss")
+                avg_idmf_u_loss = _avg_extra("idmf_u_loss")
+                avg_idmf_v_loss = _avg_extra("idmf_v_loss")
+                avg_idmf_u_weighted_loss = _avg_extra("idmf_u_weighted_loss")
+                avg_idmf_v_weighted_loss = _avg_extra("idmf_v_weighted_loss")
+                avg_jvp_tangent_norm = _avg_extra("jvp_tangent_norm")
+                avg_jvp_correction_norm = _avg_extra("jvp_correction_norm")
+                avg_v_target_norm = _avg_extra("v_target_norm")
                 avg_dmf_aux_contribution = _avg_extra("dmf_aux_contribution")
+                avg_aux_to_fm_ratio = _avg_extra("aux_to_fm_ratio")
 
                 avg_grad_norm = None
                 if any("grad_norm" in info for info in infos):
@@ -844,6 +1058,11 @@ def train_loop(config: _config.TrainConfig):
                         loss_parts += f" aux={avg_dmf_aux_contribution:.4f}"
                     if avg_imf_u_loss is not None and avg_imf_v_loss is not None:
                         loss_parts += f" imf_u={avg_imf_u_loss:.4f} imf_v={avg_imf_v_loss:.4f}"
+                    if avg_idmf_u_loss is not None and avg_idmf_v_loss is not None:
+                        loss_parts += (
+                            f" idmf_u={avg_idmf_u_loss:.4f} idmf_v={avg_idmf_v_loss:.4f}"
+                            f" corr={avg_jvp_correction_norm:.3f} aux/fm={avg_aux_to_fm_ratio:.3f}"
+                        )
                 logging.info(
                     f"step={global_step} loss={avg_loss:.4f}{loss_parts} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
                     if avg_grad_norm is not None
@@ -872,8 +1091,24 @@ def train_loop(config: _config.TrainConfig):
                             log_payload["imf_u_weighted_loss"] = avg_imf_u_weighted_loss
                         if avg_imf_v_weighted_loss is not None:
                             log_payload["imf_v_weighted_loss"] = avg_imf_v_weighted_loss
+                        if avg_idmf_u_loss is not None:
+                            log_payload["idmf_u_loss"] = avg_idmf_u_loss
+                        if avg_idmf_v_loss is not None:
+                            log_payload["idmf_v_loss"] = avg_idmf_v_loss
+                        if avg_idmf_u_weighted_loss is not None:
+                            log_payload["idmf_u_weighted_loss"] = avg_idmf_u_weighted_loss
+                        if avg_idmf_v_weighted_loss is not None:
+                            log_payload["idmf_v_weighted_loss"] = avg_idmf_v_weighted_loss
+                        if avg_jvp_tangent_norm is not None:
+                            log_payload["jvp_tangent_norm"] = avg_jvp_tangent_norm
+                        if avg_jvp_correction_norm is not None:
+                            log_payload["jvp_correction_norm"] = avg_jvp_correction_norm
+                        if avg_v_target_norm is not None:
+                            log_payload["v_target_norm"] = avg_v_target_norm
                         if avg_dmf_aux_contribution is not None:
                             log_payload["dmf_aux_contribution"] = avg_dmf_aux_contribution
+                        if avg_aux_to_fm_ratio is not None:
+                            log_payload["aux_to_fm_ratio"] = avg_aux_to_fm_ratio
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
                     wandb.log(log_payload, step=global_step)
@@ -881,7 +1116,6 @@ def train_loop(config: _config.TrainConfig):
                 start_time = time.time()
                 infos = []  # Reset stats collection
 
-            global_step += 1
             # Save checkpoint using the new mechanism
             save_checkpoint(model, optim, global_step, config, is_main, data_config)
 
@@ -903,6 +1137,7 @@ def train_loop(config: _config.TrainConfig):
     cleanup_ddp()
 
 
+@record
 def main():
     init_logging()
     config = _config.cli()

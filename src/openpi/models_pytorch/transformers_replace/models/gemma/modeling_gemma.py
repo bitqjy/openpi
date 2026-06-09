@@ -456,6 +456,9 @@ class GemmaModel(GemmaPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         adarms_cond: Optional[torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = None,
         dmf_depth: Optional[int] = None,
+        dmf_split_mode: str = "hard",
+        dmf_blend_width: int = 1,
+        dmf_alpha_scale: float = 1.0,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
         """
@@ -520,6 +523,21 @@ class GemmaModel(GemmaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
+        def _dmf_layer_alpha(layer_idx: int):
+            if dmf_depth is None:
+                return 0.0
+            if dmf_split_mode == "hard":
+                return float(dmf_alpha_scale) if layer_idx >= dmf_depth else 0.0
+            if dmf_split_mode == "soft":
+                raw = (layer_idx - dmf_depth + 1) / float(max(1, dmf_blend_width))
+                alpha = max(0.0, min(1.0, raw))
+                return float(dmf_alpha_scale) * alpha
+            raise ValueError(f"Unsupported dmf_split_mode: {dmf_split_mode}")
+
+        def _blend_cond(cond_pair, alpha: float):
+            t_cond, r_cond = cond_pair
+            return t_cond + alpha * (r_cond - t_cond)
+
         for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -527,7 +545,7 @@ class GemmaModel(GemmaPreTrainedModel):
             if isinstance(adarms_cond, tuple):
                 if dmf_depth is None:
                     raise ValueError("dmf_depth must be set when adarms_cond is a (t, r) tuple.")
-                layer_adarms_cond = adarms_cond[0] if layer_idx < dmf_depth else adarms_cond[1]
+                layer_adarms_cond = _blend_cond(adarms_cond, _dmf_layer_alpha(layer_idx))
 
             layer_outputs = decoder_layer(
                 hidden_states,
@@ -547,7 +565,11 @@ class GemmaModel(GemmaPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-        final_adarms_cond = adarms_cond[1] if isinstance(adarms_cond, tuple) else adarms_cond
+        final_adarms_cond = (
+            _blend_cond(adarms_cond, _dmf_layer_alpha(self.config.num_hidden_layers - 1))
+            if isinstance(adarms_cond, tuple)
+            else adarms_cond
+        )
         hidden_states, _ = self.norm(hidden_states, final_adarms_cond)
 
         # add hidden states from the last decoder layer

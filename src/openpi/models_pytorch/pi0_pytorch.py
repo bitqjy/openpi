@@ -114,6 +114,9 @@ class PI0Pytorch(nn.Module):
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
         self.dmf_depth: int | None = None
+        self.dmf_split_mode: str = "hard"
+        self.dmf_blend_width: int = 1
+        self.dmf_alpha_scale: float = 1.0
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         try:
@@ -146,18 +149,29 @@ class PI0Pytorch(nn.Module):
         """Check if gradient checkpointing is enabled."""
         return self.gradient_checkpointing_enabled
 
-    def set_dmf_depth(self, dmf_depth: int | None):
+    def set_dmf_depth(
+        self,
+        dmf_depth: int | None,
+        *,
+        split_mode: str = "hard",
+        blend_width: int = 1,
+        alpha_scale: float = 1.0,
+    ):
         """Set the action-expert layer split for pi0.5 DMF.
 
-        Layers before this depth use the source-time condition t; layers at and
-        after this depth use the target-time condition r. None disables the
-        strict split and falls back to the model's standard single-time path.
+        Hard mode uses t before the split and r after it. Soft mode blends from
+        t toward r across late layers, which is gentler for pretrained pi0.5.
         """
         if dmf_depth is not None:
             num_layers = len(self.paligemma_with_expert.gemma_expert.model.layers)
             if dmf_depth <= 0 or dmf_depth >= num_layers:
                 raise ValueError(f"dmf_depth must be in [1, {num_layers - 1}], got {dmf_depth}.")
+        if split_mode not in {"hard", "soft"}:
+            raise ValueError(f"Unsupported dmf split_mode: {split_mode}")
         self.dmf_depth = dmf_depth
+        self.dmf_split_mode = split_mode
+        self.dmf_blend_width = max(1, int(blend_width))
+        self.dmf_alpha_scale = float(alpha_scale)
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -386,6 +400,9 @@ class PI0Pytorch(nn.Module):
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
                 dmf_depth=self.dmf_depth,
+                dmf_split_mode=self.dmf_split_mode,
+                dmf_blend_width=self.dmf_blend_width,
+                dmf_alpha_scale=self.dmf_alpha_scale,
             )
             return suffix_out
 
@@ -534,6 +551,9 @@ class PI0Pytorch(nn.Module):
             use_cache=False,
             adarms_cond=[None, adarms_cond],
             dmf_depth=self.dmf_depth,
+            dmf_split_mode=self.dmf_split_mode,
+            dmf_blend_width=self.dmf_blend_width,
+            dmf_alpha_scale=self.dmf_alpha_scale,
         )
 
         suffix_out = outputs_embeds[1]

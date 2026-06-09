@@ -97,6 +97,9 @@ class PaliGemmaWithExpertModel(nn.Module):
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
         dmf_depth: int | None = None,
+        dmf_split_mode: str = "hard",
+        dmf_blend_width: int = 1,
+        dmf_alpha_scale: float = 1.0,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -121,6 +124,9 @@ class PaliGemmaWithExpertModel(nn.Module):
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
                 dmf_depth=dmf_depth,
+                dmf_split_mode=dmf_split_mode,
+                dmf_blend_width=dmf_blend_width,
+                dmf_alpha_scale=dmf_alpha_scale,
             )
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
@@ -156,6 +162,21 @@ class PaliGemmaWithExpertModel(nn.Module):
                     )
                 self._debug_gc_printed = True
 
+            def _dmf_layer_alpha(layer_idx: int, dmf_depth: int | None, num_layers: int):
+                if dmf_depth is None:
+                    return 0.0
+                if dmf_split_mode == "hard":
+                    return float(dmf_alpha_scale) if layer_idx >= dmf_depth else 0.0
+                if dmf_split_mode == "soft":
+                    raw = (layer_idx - dmf_depth + 1) / float(max(1, dmf_blend_width))
+                    alpha = max(0.0, min(1.0, raw))
+                    return float(dmf_alpha_scale) * alpha
+                raise ValueError(f"Unsupported dmf_split_mode: {dmf_split_mode}")
+
+            def _blend_cond(cond_pair, alpha: float):
+                t_cond, r_cond = cond_pair
+                return t_cond + alpha * (r_cond - t_cond)
+
             # Define the complete layer computation function for gradient checkpointing
             def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
                 models = [self.paligemma.language_model, self.gemma_expert.model]
@@ -163,9 +184,8 @@ class PaliGemmaWithExpertModel(nn.Module):
                 if isinstance(layer_adarms_cond[1], tuple):
                     if dmf_depth is None:
                         raise ValueError("dmf_depth must be set when suffix adarms_cond is a (t, r) tuple.")
-                    layer_adarms_cond[1] = (
-                        layer_adarms_cond[1][0] if layer_idx < dmf_depth else layer_adarms_cond[1][1]
-                    )
+                    alpha = _dmf_layer_alpha(layer_idx, dmf_depth, num_layers)
+                    layer_adarms_cond[1] = _blend_cond(layer_adarms_cond[1], alpha)
 
                 query_states = []
                 key_states = []
@@ -273,7 +293,8 @@ class PaliGemmaWithExpertModel(nn.Module):
                 for i, hidden_states in enumerate(inputs_embeds):
                     final_cond = adarms_cond[i]
                     if isinstance(final_cond, tuple):
-                        final_cond = final_cond[1]
+                        alpha = _dmf_layer_alpha(num_layers - 1, dmf_depth, num_layers)
+                        final_cond = _blend_cond(final_cond, alpha)
                     out_emb, _ = models[i].norm(hidden_states, cond=final_cond)
                     outputs_embeds.append(out_emb)
                 return outputs_embeds
