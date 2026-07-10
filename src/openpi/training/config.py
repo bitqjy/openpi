@@ -364,6 +364,7 @@ class LeRobotManiSkillDataConfig(DataConfigFactory):
     delta_action_dim: int | None = None
     absolute_action_dim: int = 1
     extra_delta_transform: bool = True
+    use_quantile_norm: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -418,6 +419,7 @@ class LeRobotManiSkillDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            use_quantile_norm=self.use_quantile_norm,
         )
 
 
@@ -771,8 +773,31 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_maniskill",
-        # Keep the model action_dim at 32 to match pi0.5 base weights; the
-        # ManiSkill data/output transforms keep the real control action at 8D.
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotManiSkillDataConfig(
+            repo_id="local/maniskill_myws_multitask",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            output_action_dim=8,
+            delta_action_dim=7,
+            absolute_action_dim=1,
+            use_quantile_norm=False,
+        ),
+        batch_size=256,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_maniskill_quantile",
         model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16, discrete_state_input=True),
         data=LeRobotManiSkillDataConfig(
             repo_id="local/maniskill_myws_multitask",
@@ -781,16 +806,9 @@ _CONFIGS = [
             output_action_dim=8,
             delta_action_dim=7,
             absolute_action_dim=1,
+            use_quantile_norm=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
         num_train_steps=30_000,
     ),
     TrainConfig(
