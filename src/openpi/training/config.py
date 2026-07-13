@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.maniskill_policy as maniskill_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -356,6 +357,61 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotManiSkillDataConfig(DataConfigFactory):
+    """LeRobot config for ManiSkill datasets converted by scripts/convert_traj_to_lerobot.py."""
+
+    output_action_dim: int = 8
+    absolute_action_dim: int = 1
+    extra_delta_transform: bool = True
+    use_quantile_norm: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[maniskill_policy.ManiSkillInputs(model_type=model_config.model_type)],
+            outputs=[maniskill_policy.ManiSkillOutputs(action_dim=self.output_action_dim)],
+        )
+
+        if self.extra_delta_transform:
+            if self.output_action_dim <= self.absolute_action_dim:
+                raise ValueError("output_action_dim must be larger than absolute_action_dim when using delta actions.")
+            # ManiSkill pd_joint_pos actions are [q1..q7, gripper]: arm joints are delta-trained,
+            # while the gripper remains absolute and outputs are converted back to pd_joint_pos at inference.
+            delta_action_mask = _transforms.make_bool_mask(
+                self.output_action_dim - self.absolute_action_dim,
+                -self.absolute_action_dim,
+            )
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            use_quantile_norm=self.use_quantile_norm,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -676,6 +732,20 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
+        name="pi0_maniskill",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotManiSkillDataConfig(
+            repo_id="local/maniskill_myws_multitask",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            output_action_dim=8,
+            absolute_action_dim=1,
+            use_quantile_norm=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
         name="pi0_libero_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
@@ -747,6 +817,30 @@ _CONFIGS = [
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_maniskill",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=True),
+        data=LeRobotManiSkillDataConfig(
+            repo_id="local/maniskill_myws_multitask",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            output_action_dim=8,
+            absolute_action_dim=1,
+            use_quantile_norm=True,
         ),
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rerun-sdk"
+version = "0.23.1"
+description = "Headless stub of rerun-sdk for ARM openpi training"
+requires-python = ">=3.11"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
