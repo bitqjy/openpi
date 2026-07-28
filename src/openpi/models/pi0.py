@@ -1,4 +1,6 @@
+import dataclasses
 import logging
+from typing import Any
 
 import einops
 import flax.nnx as nnx
@@ -14,6 +16,15 @@ import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
+
+
+@dataclasses.dataclass(frozen=True)
+class _PrefixInferenceCache:
+    """Frozen prefix KV state reused by latent-aware action inference."""
+
+    observation: _model.Observation
+    prefix_mask: jnp.ndarray
+    kv_cache: Any
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -212,6 +223,207 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
+    def _prepare_prefix_for_inference(
+        self,
+        observation: _model.Observation,
+    ) -> _PrefixInferenceCache:
+        """Run the prefix once and retain its observation, mask, and KV cache."""
+
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        return _PrefixInferenceCache(
+            observation=observation,
+            prefix_mask=prefix_mask,
+            kv_cache=kv_cache,
+        )
+
+    def _sample_actions_and_action_latent_from_prefix_cache(
+        self,
+        rng: at.KeyArrayLike,
+        cache: _PrefixInferenceCache,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> tuple[_model.Actions, jnp.ndarray]:
+        """Return actions and their final action-expert hidden representation."""
+
+        observation = cache.observation
+        prefix_mask = cache.prefix_mask
+        kv_cache = cache.kv_cache
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(
+                rng, (batch_size, self.action_horizon, self.action_dim)
+            )
+        prefix_len = prefix_mask.shape[1]
+
+        def step(carry):
+            x_t, time, _ = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask = einops.repeat(
+                prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1]
+            )
+            full_attn_mask = jnp.concatenate(
+                [prefix_attn_mask, suffix_attn_mask], axis=-1
+            )
+            assert full_attn_mask.shape == (
+                batch_size,
+                suffix_tokens.shape[1],
+                prefix_len + suffix_tokens.shape[1],
+            )
+            positions = (
+                jnp.sum(prefix_mask, axis=-1)[:, None]
+                + jnp.cumsum(suffix_mask, axis=-1)
+                - 1
+            )
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out is None
+            action_hidden = suffix_out[:, -self.action_horizon :]
+            v_t = self.action_out_proj(action_hidden)
+            action_latent = jnp.mean(action_hidden.astype(jnp.float32), axis=1)
+            return x_t + dt * v_t, time + dt, action_latent
+
+        def cond(carry):
+            _, time, _ = carry
+            return time >= -dt / 2
+
+        initial_latent = jnp.zeros(
+            (batch_size, self.action_in_proj.out_features), dtype=jnp.float32
+        )
+        x_0, _, action_latent = jax.lax.while_loop(
+            cond, step, (noise, 1.0, initial_latent)
+        )
+        return x_0, action_latent
+
+    def _sample_actions_and_action_latents_from_prefix_cache(
+        self,
+        rng: at.KeyArrayLike,
+        cache: _PrefixInferenceCache,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> tuple[_model.Actions, jnp.ndarray, jnp.ndarray]:
+        """Return actions plus global and temporally pooled final hidden tokens."""
+
+        num_temporal_bins = 5
+        if self.action_horizon % num_temporal_bins != 0:
+            raise ValueError(
+                f"action_horizon={self.action_horizon} must be divisible by "
+                f"num_temporal_bins={num_temporal_bins}"
+            )
+
+        observation = cache.observation
+        prefix_mask = cache.prefix_mask
+        kv_cache = cache.kv_cache
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+        prefix_len = prefix_mask.shape[1]
+
+        def step(carry):
+            x_t, time, _ = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask = einops.repeat(
+                prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1]
+            )
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            assert full_attn_mask.shape == (
+                batch_size,
+                suffix_tokens.shape[1],
+                prefix_len + suffix_tokens.shape[1],
+            )
+            positions = (
+                jnp.sum(prefix_mask, axis=-1)[:, None]
+                + jnp.cumsum(suffix_mask, axis=-1)
+                - 1
+            )
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out is None
+            action_hidden = suffix_out[:, -self.action_horizon :]
+            v_t = self.action_out_proj(action_hidden)
+            return x_t + dt * v_t, time + dt, action_hidden.astype(jnp.float32)
+
+        def cond(carry):
+            _, time, _ = carry
+            return time >= -dt / 2
+
+        initial_tokens = jnp.zeros(
+            (batch_size, self.action_horizon, self.action_in_proj.out_features),
+            dtype=jnp.float32,
+        )
+        x_0, _, action_tokens = jax.lax.while_loop(
+            cond, step, (noise, 1.0, initial_tokens)
+        )
+        action_latent = jnp.mean(action_tokens, axis=1)
+        temporal_latent = jnp.mean(
+            action_tokens.reshape(
+                batch_size,
+                num_temporal_bins,
+                self.action_horizon // num_temporal_bins,
+                self.action_in_proj.out_features,
+            ),
+            axis=2,
+        )
+        return x_0, action_latent, temporal_latent
+
+    def sample_actions_with_action_latent(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> tuple[_model.Actions, jnp.ndarray]:
+        """Return actions and the mean final-denoise action-suffix hidden token."""
+
+        cache = self._prepare_prefix_for_inference(observation)
+        return self._sample_actions_and_action_latent_from_prefix_cache(
+            rng, cache, num_steps=num_steps, noise=noise
+        )
+
+    def sample_actions_with_action_latents(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> tuple[_model.Actions, jnp.ndarray, jnp.ndarray]:
+        """Return actions, global mean latent, and ordered temporal latent bins."""
+
+        cache = self._prepare_prefix_for_inference(observation)
+        return self._sample_actions_and_action_latents_from_prefix_cache(
+            rng,
+            cache,
+            num_steps=num_steps,
+            noise=noise,
+        )
 
     @override
     def sample_actions(
