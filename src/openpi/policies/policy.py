@@ -35,6 +35,7 @@ class Policy(BasePolicy):
         is_pytorch: bool = False,
         return_frozen_action_latent: bool = False,
         return_frozen_action_temporal_latent: bool = False,
+        return_safe_pre_velocity: bool = False,
     ):
         """Initialize the Policy.
 
@@ -60,16 +61,23 @@ class Policy(BasePolicy):
         self._return_frozen_action_latent = bool(
             return_frozen_action_latent or self._return_frozen_action_temporal_latent
         )
+        self._return_safe_pre_velocity = bool(return_safe_pre_velocity)
+        if self._return_frozen_action_latent and self._return_safe_pre_velocity:
+            raise ValueError(
+                "Frozen RL latent and SAFE pre-velocity output modes are mutually exclusive"
+            )
 
         if self._is_pytorch_model:
-            if self._return_frozen_action_latent:
-                raise ValueError("Frozen latent inference currently requires a JAX Pi0 model")
+            if self._return_frozen_action_latent or self._return_safe_pre_velocity:
+                raise ValueError("Latent inference currently requires a JAX Pi0 model")
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
         else:
             # JAX model setup
-            if self._return_frozen_action_temporal_latent:
+            if self._return_safe_pre_velocity:
+                sample_method = model.sample_actions_with_safe_pre_velocity
+            elif self._return_frozen_action_temporal_latent:
                 sample_method = model.sample_actions_with_action_latents
             elif self._return_frozen_action_latent:
                 sample_method = model.sample_actions_with_action_latent
@@ -105,8 +113,11 @@ class Policy(BasePolicy):
         start_time = time.monotonic()
         frozen_action_latent = None
         frozen_action_temporal_latent = None
+        safe_pre_velocity = None
         sampled = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
-        if self._return_frozen_action_temporal_latent:
+        if self._return_safe_pre_velocity:
+            sampled_actions, safe_pre_velocity = sampled
+        elif self._return_frozen_action_temporal_latent:
             sampled_actions, frozen_action_latent, frozen_action_temporal_latent = sampled
         elif self._return_frozen_action_latent:
             sampled_actions, frozen_action_latent = sampled
@@ -124,6 +135,10 @@ class Policy(BasePolicy):
             outputs["frozen_pi0_latent"] = np.asarray(frozen_action_latent[0, ...], dtype=np.float32)
         if frozen_action_temporal_latent is not None:
             outputs["frozen_pi0_temporal_latent"] = np.asarray(frozen_action_temporal_latent[0, ...], dtype=np.float32)
+        if safe_pre_velocity is not None:
+            outputs["safe_pi0_pre_velocity"] = np.asarray(
+                safe_pre_velocity[0, ...], dtype=np.float32
+            )
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

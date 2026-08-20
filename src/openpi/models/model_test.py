@@ -72,6 +72,29 @@ def test_pi0_frozen_action_latent_preserves_actions():
     assert np.max(np.abs(np.asarray(latent) - np.asarray(other_latent))) > 1e-5
 
 
+def test_pi0_safe_pre_velocity_preserves_actions():
+    key = jax.random.key(31)
+    config = pi0_config.Pi0Config(
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        action_dim=8,
+        action_horizon=10,
+        max_token_len=8,
+    )
+    model = config.create(key)
+    obs = config.fake_obs(batch_size=1)
+    noise = jax.random.normal(jax.random.key(32), (1, 10, 8))
+
+    base_actions = model.sample_actions(key, obs, num_steps=2, noise=noise)
+    safe_actions, pre_velocity = model.sample_actions_with_safe_pre_velocity(
+        key, obs, num_steps=2, noise=noise
+    )
+
+    np.testing.assert_array_equal(np.asarray(safe_actions), np.asarray(base_actions))
+    assert pre_velocity.shape == (1, 4 * 64)
+    assert np.all(np.isfinite(np.asarray(pre_velocity)))
+
+
 def test_pi0_temporal_action_latent_rejects_nondivisible_bins():
     key = jax.random.key(21)
     config = pi0_config.Pi0Config(

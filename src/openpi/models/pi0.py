@@ -425,6 +425,105 @@ class Pi0(_model.BaseModel):
             noise=noise,
         )
 
+    def sample_actions_with_safe_pre_velocity(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> tuple[_model.Actions, jnp.ndarray]:
+        """Return actions and SAFE's unpooled pre-velocity endpoint tokens.
+
+        SAFE records action-expert hidden states before ``action_out_proj`` as
+        ``[diffusion_step, action_horizon, hidden_dim]`` and evaluates
+        ``concat-2`` along both token axes.  Keeping the four endpoints here
+        avoids transferring the full 10x50 token grid while preserving that
+        official feature selection exactly.
+        """
+
+        cache = self._prepare_prefix_for_inference(observation)
+        observation = cache.observation
+        prefix_mask = cache.prefix_mask
+        kv_cache = cache.kv_cache
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(
+                rng, (batch_size, self.action_horizon, self.action_dim)
+            )
+        prefix_len = prefix_mask.shape[1]
+        endpoint_shape = (
+            batch_size,
+            2,
+            self.action_in_proj.out_features,
+        )
+
+        def step(carry):
+            x_t, time, first_endpoints, last_endpoints, index = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask = einops.repeat(
+                prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1]
+            )
+            full_attn_mask = jnp.concatenate(
+                [prefix_attn_mask, suffix_attn_mask], axis=-1
+            )
+            assert full_attn_mask.shape == (
+                batch_size,
+                suffix_tokens.shape[1],
+                prefix_len + suffix_tokens.shape[1],
+            )
+            positions = (
+                jnp.sum(prefix_mask, axis=-1)[:, None]
+                + jnp.cumsum(suffix_mask, axis=-1)
+                - 1
+            )
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out is None
+            action_hidden = suffix_out[:, -self.action_horizon :]
+            action_hidden_float = action_hidden.astype(jnp.float32)
+            horizon_endpoints = jnp.stack(
+                [action_hidden_float[:, 0, :], action_hidden_float[:, -1, :]], axis=1
+            )
+            first_endpoints = jax.lax.cond(
+                index == 0,
+                lambda _: horizon_endpoints,
+                lambda _: first_endpoints,
+                operand=None,
+            )
+            v_t = self.action_out_proj(action_hidden)
+            return (
+                x_t + dt * v_t,
+                time + dt,
+                first_endpoints,
+                horizon_endpoints,
+                index + 1,
+            )
+
+        def cond(carry):
+            _, time, _, _, _ = carry
+            return time >= -dt / 2
+
+        empty_endpoints = jnp.zeros(endpoint_shape, dtype=jnp.float32)
+        x_0, _, first_endpoints, last_endpoints, _ = jax.lax.while_loop(
+            cond,
+            step,
+            (noise, 1.0, empty_endpoints, empty_endpoints, 0),
+        )
+        pre_velocity = jnp.concatenate(
+            [first_endpoints, last_endpoints], axis=1
+        ).reshape(batch_size, -1)
+        return x_0, pre_velocity
+
     @override
     def sample_actions(
         self,
