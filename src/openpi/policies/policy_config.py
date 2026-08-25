@@ -24,6 +24,7 @@ def create_trained_policy(
     pytorch_device: str | None = None,
     return_frozen_action_latent: bool = False,
     return_frozen_action_temporal_latent: bool = False,
+    return_safe_pre_velocity: bool = False,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -95,4 +96,5 @@ def create_trained_policy(
         pytorch_device=pytorch_device if is_pytorch else None,
         return_frozen_action_latent=return_frozen_action_latent,
         return_frozen_action_temporal_latent=return_frozen_action_temporal_latent,
+        return_safe_pre_velocity=return_safe_pre_velocity,
     )
