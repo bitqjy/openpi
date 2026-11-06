@@ -138,7 +138,31 @@ JAX_PLATFORMS=cpu .venv/bin/python -m pytest -q \
   src/openpi/models/action_moe_test.py src/openpi/training/phase_labels_test.py
 ```
 
-新增 MoE 配置尚需在 A800 上实际验收完整模型的显存、吞吐和训练；不能用此前 dense
-训练验收代替。零初始化保持初始动作函数，不保证全参数训练后的成功率。
+2026-11-06 已在单张 **A800-SXM4-80GB** 上完成完整模型验收，代码提交
+`34d763285145e3367a9ac1726aad9071397d7b96`，batch 8、2 个数据 worker、FSDP 1：
+
+- 真实四任务数据完成两步全参数更新，再用 `--resume` 恢复模型、优化器、EMA 和步数，
+  从 train step 2 继续更新到 3。三步 loss 和梯度范数均有限。
+- 验收专用 CLI 覆盖 `--model.action-moe.phase-warmup-steps 0`
+  `--model.action-moe.phase-ramp-steps 1 --log-interval 1`，确认第 1 步阶段监督实际启用：
+  flow loss 0.3129、phase loss 1.3918、总 loss 0.3408。正式配置的 1,000 步 warmup
+  和 1,000 步 ramp 保持不变；不要从这个短验收实验续跑正式训练。
+- 从最终 checkpoint 的 EMA 参数重新加载，每个任务选一条真实观测，均能在
+  **不加载阶段标签、不提供未来动作**时输出有限的 `(10, 8)` 绝对关节/夹爪目标。
+  四任务的关节 delta、mean/std 归一化及逆变换检查均通过。
+- 18 层四专家输出权重形状为 `(18, 4, 16, 1024)`；四个专家均已从全零初始化更新。
+  此时 EMA 输出权重范数仍仅约 `6.5e-8–7.1e-8`，不能据此宣称已学到动作分工。
+- `nvidia-smi` 每 5 秒采样的训练/续训显存峰值为 **74,825 MiB（约 73.1 GiB）**。
+  这包含 JAX 90% 显存预分配，不能作为新增模块实际显存开销的测量。
+  四条观测的同步重复推理耗时约 82–104 ms；含首次编译的首条推理约 33.5 秒。
+  这些是短验收数据，尚未测量长期训练吞吐或与 dense 的等条件性能差异。
+
+主项目中的验收脚本、日志和报告位于 `outputs/moe_a800_validation_20261106/`。
+最终 checkpoint 位于
+`checkpoints_openpi/pi05_maniskill_phase_moe_full/luna_phase_moe_accept_20261106/2`；
+目录编号为保存时的循环索引，内部 train step 为 3。
+服务器源数据指纹与本地审计一致，仍为 217 episodes、48,271 帧。
+
+零初始化保持初始动作函数，不保证全参数训练后的成功率。
 最终应按 episode/seed 留出验证，分别评估四任务成功率、动作连续性、延迟，
 并通过强制切换/屏蔽专家验证动作分工。路由分类准确率本身不等于技能已经形成。
