@@ -34,6 +34,8 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
+from openpi.models.action_moe import ActionMoEConfig
+from openpi.models.action_moe import ResidualExperts
 import openpi.models.lora as lora
 import openpi.shared.array_typing as at
 import openpi.training.sharding as sharding
@@ -285,12 +287,13 @@ class Block(nn.Module):
     """Transformer block."""
 
     configs: tuple[Config, ...]
+    action_moe: ActionMoEConfig | None = None
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, moe_gates=None):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -316,12 +319,17 @@ class Block(nn.Module):
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
                 x, gate = RMSNorm(name=_name("pre_ffw_norm", i))(x, adarms_cond[i])  # noqa: PLW2901
+                ffn_input = x
                 x = lora.FeedForward(  # noqa: PLW2901
                     features=config.width,
                     hidden_dim=config.mlp_dim,
                     name=_name("mlp", i),
                     lora_config=config.lora_configs.get("ffn"),
                 )(x)
+                if i == 1 and self.action_moe is not None:
+                    if moe_gates is None:
+                        raise ValueError("Action MoE requires observation-derived gates.")
+                    x = x + ResidualExperts(self.action_moe, config.width, name="action_moe")(ffn_input, moe_gates)  # noqa: PLW2901
             out.append(x)
             gates.append(gate if x is not None else None)
 
@@ -346,6 +354,7 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    action_moe: ActionMoEConfig | None = None
 
     def setup(self):
         # all experts must have the same depth
@@ -372,10 +381,12 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+                nn.broadcast,
+            ),  # kv_cache is scanned; positions, mask, adarms, deterministic and gates are broadcast.
             length=self.configs[0].depth,
         )(
             configs=self.configs,
+            action_moe=self.action_moe,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
         )
@@ -396,13 +407,14 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
+        moe_gates: at.Float[at.Array, "b e"] | None = None,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic, moe_gates)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
@@ -418,6 +430,11 @@ class Module(nn.Module):
             jnp.zeros((1, len(self.configs)), dtype=jnp.int32),
             jnp.zeros((1, len(self.configs), len(self.configs)), dtype=bool),
             adarms_cond=[jnp.zeros((1, c.width)) if u else None for u, c in zip(use_adarms, self.configs, strict=True)],
+            moe_gates=(
+                jnp.ones((1, self.action_moe.num_experts)) / self.action_moe.num_experts
+                if self.action_moe is not None
+                else None
+            ),
         )
 
 

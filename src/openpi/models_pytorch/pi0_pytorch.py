@@ -83,6 +83,8 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 class PI0Pytorch(nn.Module):
     def __init__(self, config):
+        if getattr(config, "action_moe", None) is not None:
+            raise NotImplementedError("Phase MoE requires the JAX model and scripts/train.py.")
         super().__init__()
         self.config = config
         self.pi05 = config.pi05

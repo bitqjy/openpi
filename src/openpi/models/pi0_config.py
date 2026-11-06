@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
+from openpi.models.action_moe import ActionMoEConfig
 import openpi.models.gemma as _gemma
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
@@ -31,8 +32,11 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    action_moe: ActionMoEConfig | None = None
 
     def __post_init__(self):
+        if self.action_moe is not None and not self.pi05:
+            raise ValueError("The phase MoE recipe currently supports JAX pi05 only.")
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
@@ -71,6 +75,14 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                phase_targets=(
+                    jax.ShapeDtypeStruct([batch_size, self.action_moe.num_experts], jnp.float32)
+                    if self.action_moe is not None
+                    else None
+                ),
+                phase_confidence=(
+                    jax.ShapeDtypeStruct([batch_size], jnp.float32) if self.action_moe is not None else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

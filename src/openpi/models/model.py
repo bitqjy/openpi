@@ -106,6 +106,10 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Training-only weak targets; never passed to the action router.
+    phase_targets: at.Float[ArrayT, "*b e"] | None = None
+    phase_confidence: at.Float[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +130,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            phase_targets=data.get("phase_targets"),
+            phase_confidence=data.get("phase_confidence"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -205,6 +211,8 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        phase_targets=observation.phase_targets,
+        phase_confidence=observation.phase_confidence,
     )
 
 
@@ -241,6 +249,10 @@ class BaseModelConfig(abc.ABC):
         return nnx.merge(graphdef, state)
 
     def load_pytorch(self, train_config, weight_path: str):
+        if getattr(self, "action_moe", None) is not None:
+            raise NotImplementedError(
+                "Phase MoE is implemented for JAX only; use scripts/train.py and JAX checkpoints."
+            )
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
         safetensors.torch.load_model(model, weight_path)

@@ -13,6 +13,7 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+from openpi.models.action_moe import ActionMoEConfig
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
@@ -90,6 +91,8 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    # Training-only sidecar, validated against the original low-dimensional data.
+    phase_labels_path: str | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -365,6 +368,7 @@ class LeRobotManiSkillDataConfig(DataConfigFactory):
     absolute_action_dim: int = 1
     extra_delta_transform: bool = True
     use_quantile_norm: bool = False
+    phase_labels_path: str | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -394,9 +398,7 @@ class LeRobotManiSkillDataConfig(DataConfigFactory):
             if delta_action_dim < 0 or self.absolute_action_dim < 0:
                 raise ValueError("delta_action_dim and absolute_action_dim must be non-negative.")
             if delta_action_dim + self.absolute_action_dim > self.output_action_dim:
-                raise ValueError(
-                    "delta_action_dim + absolute_action_dim must fit within output_action_dim."
-                )
+                raise ValueError("delta_action_dim + absolute_action_dim must fit within output_action_dim.")
             # ManiSkill pd_joint_pos datasets store absolute targets as:
             # [q1, q2, q3, q4, q5, q6, q7, gripper].
             # By default, train the seven arm joints as deltas relative to state[:7],
@@ -414,12 +416,26 @@ class LeRobotManiSkillDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory()(model_config)
 
+        if self.phase_labels_path is not None:
+            repack_transform = _transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            **repack_transform.inputs[0].structure,
+                            "phase_targets": "phase_targets",
+                            "phase_confidence": "phase_confidence",
+                        }
+                    )
+                ]
+            )
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             use_quantile_norm=self.use_quantile_norm,
+            phase_labels_path=self.phase_labels_path,
         )
 
 
@@ -795,6 +811,39 @@ _CONFIGS = [
         ema_decay=0.999,
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_maniskill_phase_moe_full",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_moe=ActionMoEConfig(),
+        ),
+        data=LeRobotManiSkillDataConfig(
+            repo_id="local/luna_cleaned_20260908",
+            base_config=DataConfig(prompt_from_task=True),
+            output_action_dim=8,
+            delta_action_dim=7,
+            absolute_action_dim=1,
+            extra_delta_transform=True,
+            use_quantile_norm=False,
+            phase_labels_path="assets/phase_labels/luna_cleaned_20260908_h10.npz",
+        ),
+        batch_size=8,
+        weight_loader=weight_loaders.MoECheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # All original parameters AND added adapters/router are trainable.
+        freeze_filter=nnx.Nothing,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=2e-5,
+            decay_steps=30_000,
+            decay_lr=2e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=30_000,
+        wandb_enabled=False,
     ),
     TrainConfig(
         name="pi05_maniskill_quantile",

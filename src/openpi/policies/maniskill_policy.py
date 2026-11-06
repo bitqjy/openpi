@@ -6,7 +6,15 @@ from openpi import transforms
 from openpi.policies import libero_policy
 
 
-ManiSkillInputs = libero_policy.LiberoInputs
+@dataclasses.dataclass(frozen=True)
+class ManiSkillInputs(libero_policy.LiberoInputs):
+    def __call__(self, data: dict) -> dict:
+        inputs = super().__call__(data)
+        # Optional supervision travels alongside observations, never in state/prompt.
+        for key in ("phase_targets", "phase_confidence"):
+            if key in data:
+                inputs[key] = data[key]
+        return inputs
 
 
 @dataclasses.dataclass(frozen=True)

@@ -14,6 +14,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.phase_labels import PhaseLabeledDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -144,6 +145,11 @@ def create_torch_dataset(
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+
+    if data_config.phase_labels_path is not None:
+        dataset = PhaseLabeledDataset(
+            dataset, data_config.phase_labels_path, repo_id=repo_id, action_horizon=action_horizon
+        )
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi.models import action_moe as _action_moe
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
@@ -25,6 +26,7 @@ class _PrefixInferenceCache:
     observation: _model.Observation
     prefix_mask: jnp.ndarray
     kv_cache: Any
+    moe_gates: Any = None
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -78,6 +80,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.action_moe = config.action_moe
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -86,6 +89,7 @@ class Pi0(_model.BaseModel):
                 configs=[paligemma_config, action_expert_config],
                 embed_dtype=config.dtype,
                 adarms=config.pi05,
+                action_moe=config.action_moe,
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
@@ -109,6 +113,10 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        if config.action_moe is not None:
+            self.action_moe_router = _action_moe.ActionRouter(
+                paligemma_config.width, config.action_dim, config.action_moe, rngs=rngs
+            )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -200,6 +208,16 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        loss, _ = self.compute_loss_with_metrics(rng, observation, actions, train=train)
+        return loss
+
+    def _route_actions(self, prefix_tokens, prefix_mask, state):
+        if self.action_moe is None:
+            return None, None
+        return self.action_moe_router(prefix_tokens, prefix_mask, state)
+
+    def compute_loss_with_metrics(self, rng, observation, actions, *, train=False, step=0):
+        """Flow matching with optional phase supervision (labels are loss-only)."""
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -212,17 +230,33 @@ class Pi0(_model.BaseModel):
 
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        moe_gates, moe_probs = self._route_actions(prefix_tokens, prefix_mask, observation.state)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, adarms_cond],
+            moe_gates=moe_gates,
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        metrics = {"flow_loss": jnp.mean(flow_loss)}
+        if self.action_moe is None:
+            return flow_loss, metrics
+        if observation.phase_targets is None or observation.phase_confidence is None:
+            raise ValueError(
+                "MoE training loss requires phase_targets and phase_confidence; build/load phase labels first."
+            )
+        aux_loss, routing_metrics = _action_moe.routing_loss(
+            moe_probs, observation.phase_targets, observation.phase_confidence, self.action_moe, step
+        )
+        return flow_loss + aux_loss, {**metrics, **routing_metrics}
 
     def _prepare_prefix_for_inference(
         self,
@@ -232,6 +266,7 @@ class Pi0(_model.BaseModel):
 
         observation = _model.preprocess_observation(None, observation, train=False)
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        moe_gates, _ = self._route_actions(prefix_tokens, prefix_mask, observation.state)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
@@ -239,6 +274,7 @@ class Pi0(_model.BaseModel):
             observation=observation,
             prefix_mask=prefix_mask,
             kv_cache=kv_cache,
+            moe_gates=moe_gates,
         )
 
     def _sample_actions_and_action_latent_from_prefix_cache(
@@ -280,6 +316,7 @@ class Pi0(_model.BaseModel):
                 positions=positions,
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
+                moe_gates=cache.moe_gates,
             )
             assert prefix_out is None
             action_hidden = suffix_out[:, -self.action_horizon :]
@@ -340,6 +377,7 @@ class Pi0(_model.BaseModel):
                 positions=positions,
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
+                moe_gates=cache.moe_gates,
             )
             assert prefix_out is None
             action_hidden = suffix_out[:, -self.action_horizon :]
@@ -443,6 +481,7 @@ class Pi0(_model.BaseModel):
                 positions=positions,
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
+                moe_gates=cache.moe_gates,
             )
             assert prefix_out is None
             action_hidden = suffix_out[:, -self.action_horizon :]
@@ -498,6 +537,7 @@ class Pi0(_model.BaseModel):
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        moe_gates, _ = self._route_actions(prefix_tokens, prefix_mask, observation.state)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
@@ -530,6 +570,7 @@ class Pi0(_model.BaseModel):
                 positions=positions,
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
+                moe_gates=moe_gates,
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
